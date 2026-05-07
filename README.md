@@ -4,7 +4,7 @@ A native macOS app that fills in missing ID3 / iTunes metadata for your music
 library. iTunes' own catalog is the primary source — drop a file or folder
 in, and Minmeta searches Apple's free public Search API for each track and
 writes title / artist / album / album-artist / year / genre / track number
-+ embedded cover art back into the file.
+back into the file.
 
 For tracks that **aren't** in Apple's catalog (bootlegs, demos, very obscure
 indie) or whose **filenames are too messy** to identify (`audio_export.mp3`,
