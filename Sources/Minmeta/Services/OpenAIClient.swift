@@ -37,6 +37,17 @@ struct OpenAIClient {
         or wrong), identify the most likely correct, canonical metadata for the \
         track.
 
+        FIELD POLICY:
+          REQUIRED whenever you can identify the track at all (i.e. you've named \
+          a real artist + title): title, artist, album, album_artist, year, genre. \
+          Do not omit album — every commercial release belongs to one. If it was \
+          a single-only release, use the single's name as the album. If you're \
+          confident enough to name the artist and title, you're confident enough \
+          to name the album and year. Only return empty when you genuinely cannot \
+          identify the track.
+
+          OPTIONAL (empty is fine when uncertain): track, composer, copyright.
+
         RULES:
         1. The filename and folder path are strong hints — they often follow patterns \
            like "Artist - Title", "01 - Title", "Artist/Album/01 Title.mp3", or \
@@ -45,10 +56,12 @@ struct OpenAIClient {
         2. Prefer existing metadata only when it is internally consistent and matches \
            a known release. Fix obvious errors (mojibake, ALL CAPS noise, "Track 1" \
            placeholders).
-        3. Return CANONICAL release values — artist as credited on the official \
-           release, album as the original studio album when applicable (not greatest \
-           hits / compilations / soundtracks unless the track only exists there).
-        4. year: 4-digit year of the original studio release, not re-issues.
+        3. CANONICAL release values — artist as credited on the official release, \
+           album as the original studio album the track first appeared on (not \
+           greatest hits / compilations / soundtracks unless the track only exists \
+           there).
+        4. year: 4-digit year of the ORIGINAL studio release of the album, not \
+           re-issues. If the track is a single, use the single's release year.
         5. genre: a single common label ("Rock", "Pop", "Hip-Hop", "Jazz", \
            "Electronic", "R&B", "Classical", "Country", "Metal", "Folk", "Reggae", \
            "Soundtrack"). Avoid hyper-specific subgenres unless very well known.
@@ -56,12 +69,12 @@ struct OpenAIClient {
         7. album_artist: usually equals artist; for compilations use "Various Artists".
         8. composer: the song's primary writer(s) as credited on the release \
            (separate multiple writers with " / "). For pop/rock that's the songwriter; \
-           for classical it's the composer. Leave empty if uncertain.
+           for classical it's the composer.
         9. copyright: the © line as it appears on the release, e.g. \
            "© 2013 Daft Life Limited, under exclusive license to Columbia Records". \
-           Leave empty if uncertain. Do not fabricate label names.
-        10. If a field is unknown or your confidence is low (<70%), return an empty \
-            string for that field. Do NOT invent or guess plausible-sounding fakes.
+           Do not fabricate label names.
+        10. Do NOT invent plausible-sounding fakes. If you'd have to guess at the \
+            artist or title, return empty for ALL fields rather than half-fake data.
         11. Names must use proper title case as on the official release. Preserve \
             original-language characters and diacritics.
 

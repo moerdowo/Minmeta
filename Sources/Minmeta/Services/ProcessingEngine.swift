@@ -148,30 +148,40 @@ final class ProcessingEngine {
             return
         }
 
-        let merged = merge(existing: read.meta, ai: resolved)
-        let preview = describe(merged)
+        let aiMerged = merge(existing: read.meta, ai: resolved)
 
-        // --- 3) FETCH cover art (best-effort, time-boxed) -------------------
+        // --- 3) iTunes lookup (artwork + canonical-field backfill) ---------
+        // The model is told to leave fields empty when uncertain; iTunes'
+        // track record fills the gap for catalog music. We only ever fill
+        // empties — values the model returned are kept as-is.
         update(id: id) {
             $0.phase = .art
-            $0.aiPreview = preview
-            $0.resolved = merged
-            $0.detail = "LOOKING UP COVER ART · \(preview.isEmpty ? "—" : preview)"
+            $0.aiPreview = describe(aiMerged)
+            $0.resolved = aiMerged
+            let pv = describe(aiMerged)
+            $0.detail = "LOOKING UP ITUNES · \(pv.isEmpty ? "—" : pv)"
         }
 
-        let artwork: Artwork? = await ITunesArtClient.fetchArtwork(
-            artist: merged.artist,
-            album:  merged.album,
-            title:  merged.title,
+        let lookup = await ITunesArtClient.lookup(
+            artist: aiMerged.artist,
+            album:  aiMerged.album,
+            title:  aiMerged.title,
             timeoutSeconds: 8
         )
-        if artwork != nil {
-            log.info("processOne[\(short)]: artwork OK (\(artwork?.data.count ?? 0) bytes)")
+        if let lookup = lookup {
+            log.info("processOne[\(short)]: iTunes match album=\(lookup.albumName ?? "—") year=\(lookup.year ?? "—") art=\(lookup.artwork == nil ? "no" : "yes")")
         } else {
-            log.info("processOne[\(short)]: artwork not found")
+            log.info("processOne[\(short)]: iTunes no match")
         }
+
+        let merged = backfill(aiMerged, with: lookup)
+        let preview = describe(merged)
+        let artwork = lookup?.artwork
+
         update(id: id) {
             $0.artwork = artwork
+            $0.resolved = merged
+            $0.aiPreview = preview
         }
 
         // --- 4) WRITE tag (or skip if container unsupported) ----------------
@@ -256,6 +266,27 @@ final class ProcessingEngine {
             copyright:   ai.copyright   ?? existing.copyright,
             lyrics:      existing.lyrics  // never AI-generated
         )
+    }
+
+    /// Fills empty fields on `m` with values from the iTunes lookup. Never
+    /// overrides a field the model already provided — iTunes is a backstop,
+    /// not the source of truth.
+    private func backfill(_ m: SongMetadata,
+                          with lookup: ITunesArtClient.Match?) -> SongMetadata {
+        guard let lookup = lookup else { return m }
+        var out = m
+        if isEmpty(out.album)       { out.album       = lookup.albumName }
+        if isEmpty(out.artist)      { out.artist      = lookup.artistName }
+        if isEmpty(out.title)       { out.title       = lookup.trackName }
+        if isEmpty(out.albumArtist) { out.albumArtist = lookup.artistName }
+        if isEmpty(out.year)        { out.year        = lookup.year }
+        if isEmpty(out.genre)       { out.genre       = lookup.genre }
+        if isEmpty(out.track)       { out.track       = lookup.trackNumber }
+        return out
+    }
+
+    private func isEmpty(_ s: String?) -> Bool {
+        (s?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     private func describe(_ m: SongMetadata) -> String {
