@@ -22,6 +22,10 @@
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.music</string>
     <key>NSAppleEventsUsageDescription</key>

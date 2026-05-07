@@ -8,6 +8,14 @@ CONFIG="${CONFIG:-release}"
 APP_NAME="Minmeta"
 APP_DIR="build/${APP_NAME}.app"
 
+# Regenerate the icon if the source PNG is newer than the compiled .icns.
+if [[ App/icon-source.png -nt App/AppIcon.icns || ! -f App/AppIcon.icns ]]; then
+  echo "==> regenerating AppIcon.icns from icon-source.png"
+  rm -rf App/AppIcon.iconset
+  swift Tools/make_icon.swift App/icon-source.png App/AppIcon.iconset >/dev/null
+  iconutil -c icns App/AppIcon.iconset -o App/AppIcon.icns
+fi
+
 echo "==> swift build (${CONFIG})"
 swift build -c "${CONFIG}"
 
@@ -24,6 +32,7 @@ mkdir -p "${APP_DIR}/Contents/Resources"
 
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 cp App/Info.plist "${APP_DIR}/Contents/Info.plist"
+cp App/AppIcon.icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
 # Ad-hoc sign so Gatekeeper / TCC dialogs work nicely on first run.
 codesign --force --sign - "${APP_DIR}" >/dev/null 2>&1 || true

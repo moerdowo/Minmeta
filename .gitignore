@@ -3,3 +3,4 @@
 build/
 *.xcodeproj/
 *.swp
+App/AppIcon.iconset/
