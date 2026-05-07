@@ -94,7 +94,10 @@ final class AppState: ObservableObject {
     func retryFailed() {
         for i in queue.indices where queue[i].status == .failed {
             queue[i].status = .pending
+            queue[i].phase = .waiting
+            queue[i].startedAt = nil
             queue[i].detail = ""
+            queue[i].aiPreview = nil
         }
         startProcessingIfNeeded()
     }
@@ -109,8 +112,13 @@ struct QueueItem: Identifiable, Equatable {
     let id = UUID()
     let url: URL
     var status: Status = .pending
+    var phase: Phase = .waiting
+    var startedAt: Date? = nil
     var detail: String = ""
     var resolved: SongMetadata? = nil
+    /// Short preview of the metadata the model proposed, kept around so the
+    /// queue can keep showing it while the writer runs and after a skip.
+    var aiPreview: String? = nil
 
     enum Status: String {
         case pending    = "PENDING"
@@ -118,6 +126,39 @@ struct QueueItem: Identifiable, Equatable {
         case done       = "DONE"
         case failed     = "FAILED"
         case skipped    = "SKIPPED"
+    }
+
+    /// Sub-state during `.processing`. Drives the per-row chip, LED colour,
+    /// and progress bar in the queue UI.
+    enum Phase: String {
+        case waiting   // queued but not yet started
+        case reading   // pulling existing tags off disk
+        case asking    // calling the model
+        case writing   // committing tags to file
+        case finished  // wrapped up successfully or as a deliberate skip
+        case errored   // unrecoverable failure
+
+        var label: String {
+            switch self {
+            case .waiting:  return "WAIT"
+            case .reading:  return "READ"
+            case .asking:   return "AI"
+            case .writing:  return "TAG"
+            case .finished: return "OK"
+            case .errored:  return "X"
+            }
+        }
+
+        var fraction: Double {
+            switch self {
+            case .waiting:  return 0.05
+            case .reading:  return 0.25
+            case .asking:   return 0.65
+            case .writing:  return 0.90
+            case .finished: return 1.00
+            case .errored:  return 1.00
+            }
+        }
     }
 
     static func == (l: QueueItem, r: QueueItem) -> Bool { l.id == r.id }

@@ -36,7 +36,8 @@ final class ProcessingEngine {
             while true {
                 while inflight < concurrency, let idx = nextPendingIndex() {
                     state.queue[idx].status = .processing
-                    state.queue[idx].detail = "queued…"
+                    state.queue[idx].phase = .waiting
+                    state.queue[idx].detail = "QUEUED — WAITING FOR SLOT"
                     let id = state.queue[idx].id
                     inflight += 1
                     group.addTask { [weak self] in
@@ -56,51 +57,100 @@ final class ProcessingEngine {
 
     private func processOne(id: UUID) async {
         guard let state = state,
-              let idx = state.queue.firstIndex(where: { $0.id == id }) else { return }
+              let initialIdx = state.queue.firstIndex(where: { $0.id == id })
+        else { return }
 
-        let url = state.queue[idx].url
-        state.queue[idx].detail = "reading metadata…"
+        let url = state.queue[initialIdx].url
+
+        // 1) Reading existing tags off disk
+        update(id: id) {
+            $0.phase = .reading
+            $0.startedAt = Date()
+            $0.detail = "READING EXISTING TAGS…"
+        }
         state.statusMessage = "WORKING · " + url.lastPathComponent
 
         let existing = await MetadataReader.read(url: url)
+        let foundCount = countSet(existing)
 
-        if let i2 = state.queue.firstIndex(where: { $0.id == id }) {
-            state.queue[i2].detail = "asking model…"
+        // 2) Asking the model
+        update(id: id) {
+            $0.phase = .asking
+            let foundLine = foundCount == 0
+                ? "NO EXISTING TAGS"
+                : "\(foundCount) TAG\(foundCount == 1 ? "" : "S") ON DISK"
+            $0.detail = "ASKING \(state.model.uppercased()) · \(foundLine)"
         }
 
         let client = OpenAIClient(apiKey: state.apiKey,
                                   baseURL: state.baseURL,
                                   model: state.model)
 
+        let resolved: SongMetadata
         do {
-            let resolved = try await client.completeMetadata(
+            resolved = try await client.completeMetadata(
                 filename: url.lastPathComponent,
-                relativePath: relativePath(for: url, in: state),
+                relativePath: relativePath(for: url),
                 existing: existing
             )
-            let merged = merge(existing: existing, ai: resolved)
-
-            if let i2 = state.queue.firstIndex(where: { $0.id == id }) {
-                state.queue[i2].detail = "writing tag…"
-                state.queue[i2].resolved = merged
+        } catch {
+            update(id: id) {
+                $0.status = .failed
+                $0.phase = .errored
+                $0.detail = "AI FAILED — \(error.localizedDescription)"
             }
+            return
+        }
 
+        let merged = merge(existing: existing, ai: resolved)
+        let preview = describe(merged)
+
+        // 3) Writing tag (or skipping if container unsupported)
+        update(id: id) {
+            $0.phase = .writing
+            $0.aiPreview = preview
+            $0.resolved = merged
+            $0.detail = preview.isEmpty
+                ? "WRITING — NO FIELDS RESOLVED"
+                : "WRITING TAG · \(preview)"
+        }
+
+        do {
             try await writeIfPossible(metadata: merged, to: url)
-
-            if let i2 = state.queue.firstIndex(where: { $0.id == id }) {
-                state.queue[i2].status = .done
-                state.queue[i2].detail = describe(merged)
+            update(id: id) {
+                $0.status = .done
+                $0.phase = .finished
+                $0.detail = preview.isEmpty ? "DONE — NO FIELDS RESOLVED" : preview
+            }
+        } catch RuntimeError.unsupportedFormat(let ext) {
+            update(id: id) {
+                $0.status = .skipped
+                $0.phase = .finished
+                $0.detail = "SKIPPED · \(ext.uppercased()) WRITER NOT IMPLEMENTED"
+                    + (preview.isEmpty ? "" : " — \(preview)")
             }
         } catch {
-            if let i2 = state.queue.firstIndex(where: { $0.id == id }) {
-                state.queue[i2].status = .failed
-                state.queue[i2].detail = error.localizedDescription
+            update(id: id) {
+                $0.status = .failed
+                $0.phase = .errored
+                $0.detail = "WRITE FAILED — \(error.localizedDescription)"
             }
         }
     }
 
+    /// Mutates the queue item with the given id in-place. The closure runs on
+    /// the main actor and the assignment back into `state.queue` triggers the
+    /// SwiftUI republish so each phase transition is visible immediately.
+    private func update(id: UUID, _ mutate: (inout QueueItem) -> Void) {
+        guard let state = state,
+              let i = state.queue.firstIndex(where: { $0.id == id }) else { return }
+        var item = state.queue[i]
+        mutate(&item)
+        state.queue[i] = item
+    }
+
     /// Folder context that helps the model anchor "Artist/Album/01 Track.mp3" layouts.
-    private func relativePath(for url: URL, in state: AppState) -> String {
+    private func relativePath(for url: URL) -> String {
         let parents = url.deletingLastPathComponent().pathComponents.suffix(2)
         return parents.joined(separator: "/")
     }
@@ -113,13 +163,11 @@ final class ProcessingEngine {
         case "m4a", "mp4", "aac":
             try await M4AWriter.write(metadata: metadata, to: url)
         default:
-            // Other formats: read-only suggestion mode for now.
             throw RuntimeError.unsupportedFormat(ext)
         }
     }
 
     private func merge(existing: SongMetadata, ai: SongMetadata) -> SongMetadata {
-        // Prefer AI values when present; otherwise keep what was already on disk.
         SongMetadata(
             title:       ai.title       ?? existing.title,
             artist:      ai.artist      ?? existing.artist,
@@ -136,6 +184,13 @@ final class ProcessingEngine {
             .compactMap { $0 }
             .filter { !$0.isEmpty }
         return parts.joined(separator: " · ")
+    }
+
+    private func countSet(_ m: SongMetadata) -> Int {
+        [m.title, m.artist, m.album, m.albumArtist, m.year, m.genre, m.track]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .count
     }
 }
 
