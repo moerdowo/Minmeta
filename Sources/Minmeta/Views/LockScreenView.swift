@@ -51,7 +51,7 @@ struct LockScreenView: View {
                 }
 
                 HStack(spacing: 8) {
-                    Text("◆ KEY IS STORED IN MACOS KEYCHAIN")
+                    Text("◆ KEY STORED LOCALLY · ~/LIBRARY/APPLICATION SUPPORT/MINMETA")
                         .font(WinampTheme.smallFont)
                         .foregroundColor(WinampTheme.lcdGreenDim)
                     Spacer()
@@ -126,7 +126,7 @@ private struct BannerLCD: View {
                 Text("ENTER OPENAI-COMPATIBLE API KEY TO UNLOCK.")
                     .font(WinampTheme.pixelFont)
                     .foregroundColor(WinampTheme.lcdGreenDim)
-                Text("YOUR KEY IS STORED LOCALLY · IT NEVER LEAVES THIS MAC EXCEPT TO THE BASE URL YOU SET.")
+                Text("YOUR KEY IS STORED IN A 0600-MODE FILE IN YOUR APPLICATION SUPPORT FOLDER · IT NEVER LEAVES THIS MAC EXCEPT TO THE BASE URL YOU SET.")
                     .font(WinampTheme.smallFont)
                     .foregroundColor(WinampTheme.lcdGreenDim.opacity(0.85))
             }

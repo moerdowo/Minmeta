@@ -20,7 +20,7 @@ final class AppState: ObservableObject {
     private var engine: ProcessingEngine?
 
     init() {
-        if let key = Keychain.read(account: "openai_api_key") {
+        if let key = CredentialsStore.read(account: "openai_api_key") {
             self.apiKey = key
         }
         if let stored = UserDefaults.standard.string(forKey: "minmeta.baseURL"),
@@ -40,7 +40,7 @@ final class AppState: ObservableObject {
         let trimmedBase   = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedModel  = model.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        Keychain.save(account: "openai_api_key", value: trimmed)
+        CredentialsStore.save(account: "openai_api_key", value: trimmed)
         UserDefaults.standard.set(trimmedBase,  forKey: "minmeta.baseURL")
         UserDefaults.standard.set(trimmedModel, forKey: "minmeta.model")
 
@@ -50,7 +50,7 @@ final class AppState: ObservableObject {
     }
 
     func clearAPIKey() {
-        Keychain.delete(account: "openai_api_key")
+        CredentialsStore.delete(account: "openai_api_key")
         apiKey = ""
         showSettings = false
     }
