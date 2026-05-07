@@ -15,8 +15,6 @@ final class AppState: ObservableObject {
     @Published var isProcessing: Bool = false
     @Published var statusMessage: String = "READY"
 
-    @Published var showSettings: Bool = false
-
     private var engine: ProcessingEngine?
 
     init() {
@@ -52,7 +50,6 @@ final class AppState: ObservableObject {
     func clearAPIKey() {
         CredentialsStore.delete(account: "openai_api_key")
         apiKey = ""
-        showSettings = false
     }
 
     // MARK: - Queue

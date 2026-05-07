@@ -15,6 +15,20 @@ struct MinmetaApp: App {
                 .environmentObject(appState)
                 .background(WinampTheme.bgGradient)
                 .preferredColorScheme(.dark)
+                .focusEffectDisabled()
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+
+        // Settings as its own window. CFG button in the main panel opens
+        // it via `openWindow(id: "settings")`; the window's own Cancel /
+        // Save / red-traffic-light close are all the documented exits.
+        Window("Minmeta · Settings", id: "settings") {
+            SettingsWindowView()
+                .environmentObject(appState)
+                .background(WinampTheme.bgGradient)
+                .preferredColorScheme(.dark)
+                .focusEffectDisabled()
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)

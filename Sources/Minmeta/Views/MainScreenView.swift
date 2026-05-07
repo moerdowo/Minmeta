@@ -3,17 +3,14 @@ import UniformTypeIdentifiers
 import AppKit
 
 /// Post-unlock layout: MAIN panel with drop zone + status, then QUEUE panel
-/// underneath. A small inline settings drawer can be expanded from the main
-/// panel to edit the API key / base URL / model without going back to lock.
+/// underneath. The CFG button in the main panel's title bar opens the
+/// settings window (declared as a separate Window scene in MinmetaApp).
 struct MainScreenView: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
         VStack(spacing: 8) {
             MainPanelView()
-            if state.showSettings {
-                SettingsDrawerView()
-            }
             QueuePanelView()
         }
     }
@@ -23,6 +20,7 @@ struct MainScreenView: View {
 
 private struct MainPanelView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         WinampPanel(
@@ -30,9 +28,8 @@ private struct MainPanelView: View {
             isMain: true,
             trailing: AnyView(
                 HStack(spacing: 4) {
-                    SmallTitleButton(label: "CFG",
-                                     active: state.showSettings) {
-                        state.showSettings.toggle()
+                    SmallTitleButton(label: "CFG") {
+                        openWindow(id: "settings")
                     }
                 }
             )
@@ -299,83 +296,5 @@ private struct ProgressTrack: View {
             $0.status == .done || $0.status == .skipped
         }.count
         return CGFloat(done) / CGFloat(total)
-    }
-}
-
-// MARK: - Settings drawer (collapsible)
-
-private struct SettingsDrawerView: View {
-    @EnvironmentObject var state: AppState
-    @State private var key: String = ""
-    @State private var baseURL: String = ""
-    @State private var model: String = ""
-    @State private var note: String? = nil
-
-    var body: some View {
-        WinampPanel(title: "M I N M E T A · S E T T I N G S") {
-            VStack(alignment: .leading, spacing: 8) {
-                FieldRow(label: "API KEY (LEAVE BLANK TO KEEP CURRENT)",
-                         placeholder: "sk-...",
-                         secure: true,
-                         text: $key,
-                         onSubmit: save)
-
-                HStack(spacing: 8) {
-                    FieldRow(label: "BASE URL",
-                             placeholder: "https://api.openai.com/v1",
-                             secure: false,
-                             text: $baseURL,
-                             onSubmit: save)
-                    FieldRow(label: "MODEL",
-                             placeholder: "gpt-4o-mini",
-                             secure: false,
-                             text: $model,
-                             onSubmit: save,
-                             width: 180)
-                }
-
-                HStack {
-                    if let note = note {
-                        Text(note.uppercased())
-                            .font(WinampTheme.smallFont)
-                            .foregroundColor(WinampTheme.lcdGreen)
-                    } else {
-                        Text("◆ KEY ON FILE — \(state.apiKey.count) CHARS")
-                            .font(WinampTheme.smallFont)
-                            .foregroundColor(WinampTheme.lcdGreen)
-                    }
-                    Spacer()
-                    WinampButton(title: "FORGET KEY", width: 110,
-                                 color: WinampTheme.lcdRed) {
-                        state.clearAPIKey()
-                    }
-                    WinampButton(title: "SAVE", width: 80,
-                                 color: WinampTheme.lcdAmber, action: save)
-                }
-                .padding(.top, 2)
-            }
-            .padding(10)
-        }
-        .onAppear {
-            baseURL = state.baseURL
-            model = state.model
-        }
-    }
-
-    private func save() {
-        let trimmedKey   = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedBase  = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveKey = trimmedKey.isEmpty ? state.apiKey : trimmedKey
-        guard !effectiveKey.isEmpty else { return }
-
-        state.saveAPIKey(effectiveKey,
-                         baseURL: trimmedBase,
-                         model: trimmedModel)
-        key = ""
-        note = "saved"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            note = nil
-        }
     }
 }
