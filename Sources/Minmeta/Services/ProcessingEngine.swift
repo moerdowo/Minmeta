@@ -1,8 +1,18 @@
 import Foundation
 import SwiftUI
+import OSLog
 
 /// Drives the queue: pulls pending items, asks the model for missing fields,
-/// merges with what we read off-disk, and writes the result back into the file.
+/// fetches album art, merges with what we read off-disk, and writes the result
+/// back into the file.
+///
+/// Reliability notes:
+/// - Uses a worker-pool pattern (N workers each pulling next pending) — easier
+///   to reason about than a producer/consumer task group.
+/// - processOne() has a `defer` that guarantees the item leaves `.processing`
+///   even if a path is missed — so the queue never gets stuck visually.
+/// - Every state transition emits an OSLog line so a stuck queue is debuggable
+///   from Console.app: filter on `subsystem:id.moerdowo.minmeta`.
 @MainActor
 final class ProcessingEngine {
     private weak var state: AppState?
@@ -14,7 +24,11 @@ final class ProcessingEngine {
     init(state: AppState) { self.state = state }
 
     func kick() {
-        if task != nil { return }
+        if task != nil {
+            log.info("kick: already running, no-op")
+            return
+        }
+        log.info("kick: starting new run task")
         task = Task { [weak self] in
             await self?.run()
             self?.task = nil
@@ -24,56 +38,86 @@ final class ProcessingEngine {
     private func run() async {
         guard let state = state else { return }
         state.isProcessing = true
+        log.info("run: enter, queueSize=\(state.queue.count)")
         defer {
             state.isProcessing = false
             if state.queue.contains(where: { $0.status == .pending }) == false {
                 state.statusMessage = "READY · IDLE"
             }
+            log.info("run: exit")
         }
 
         await withTaskGroup(of: Void.self) { group in
-            var inflight = 0
-            while true {
-                while inflight < concurrency, let idx = nextPendingIndex() {
-                    state.queue[idx].status = .processing
-                    state.queue[idx].phase = .waiting
-                    state.queue[idx].detail = "QUEUED — WAITING FOR SLOT"
-                    let id = state.queue[idx].id
-                    inflight += 1
-                    group.addTask { [weak self] in
+            for w in 0..<concurrency {
+                group.addTask { [weak self] in
+                    while let id = await self?.takeNextPendingId() {
+                        log.info("worker[\(w)]: picked id=\(id.uuidString.prefix(8))")
                         await self?.processOne(id: id)
                     }
+                    log.info("worker[\(w)]: exit (no more pending)")
                 }
-                if inflight == 0 { break }
-                _ = await group.next()
-                inflight -= 1
             }
         }
     }
 
-    private func nextPendingIndex() -> Int? {
-        state?.queue.firstIndex(where: { $0.status == .pending })
+    /// Atomically claims the next pending item by flipping it to `.processing`.
+    /// Returns the item's id, or nil if no pending work remains.
+    private func takeNextPendingId() -> UUID? {
+        guard let state = state,
+              let idx = state.queue.firstIndex(where: { $0.status == .pending })
+        else { return nil }
+        var item = state.queue[idx]
+        item.status = .processing
+        item.phase = .waiting
+        item.detail = "STARTING…"
+        item.startedAt = Date()
+        state.queue[idx] = item
+        return item.id
     }
 
     private func processOne(id: UUID) async {
+        let short = id.uuidString.prefix(8)
         guard let state = state,
               let initialIdx = state.queue.firstIndex(where: { $0.id == id })
-        else { return }
+        else {
+            log.error("processOne[\(short)]: item gone before processing")
+            return
+        }
 
         let url = state.queue[initialIdx].url
+        log.info("processOne[\(short)]: \(url.lastPathComponent)")
 
-        // 1) Reading existing tags off disk
+        // GUARANTEE the item leaves .processing even if something below
+        // returns/throws past our handlers. A "stuck pending/working" row is
+        // the worst UX bug we can ship — this defer is the safety net.
+        defer {
+            update(id: id) { item in
+                if item.status == .processing {
+                    log.error("processOne[\(short)]: defer rescue — status was still processing")
+                    item.status = .failed
+                    item.phase = .errored
+                    if item.detail.isEmpty || !item.detail.lowercased().contains("fail") {
+                        item.detail = "INTERNAL — TASK ENDED WITHOUT FINAL STATUS"
+                    }
+                }
+            }
+        }
+
+        // --- 1) READ existing tags + tech info -------------------------------
         update(id: id) {
             $0.phase = .reading
-            $0.startedAt = Date()
-            $0.detail = "READING EXISTING TAGS…"
+            $0.detail = "READING EXISTING TAGS & TECH INFO…"
         }
         state.statusMessage = "WORKING · " + url.lastPathComponent
+        let read = await MetadataReader.read(url: url)
+        let foundCount = countSet(read.meta)
+        log.info("processOne[\(short)]: read tags=\(foundCount) bitrate=\(read.tech.bitrateKbps ?? 0)kbps sr=\(read.tech.sampleRateHz ?? 0)Hz dur=\(Int(read.tech.durationSeconds ?? 0))s")
 
-        let existing = await MetadataReader.read(url: url)
-        let foundCount = countSet(existing)
+        update(id: id) {
+            $0.tech = read.tech
+        }
 
-        // 2) Asking the model
+        // --- 2) ASK the model -----------------------------------------------
         update(id: id) {
             $0.phase = .asking
             let foundLine = foundCount == 0
@@ -91,9 +135,11 @@ final class ProcessingEngine {
             resolved = try await client.completeMetadata(
                 filename: url.lastPathComponent,
                 relativePath: relativePath(for: url),
-                existing: existing
+                existing: read.meta
             )
+            log.info("processOne[\(short)]: AI returned title=\(resolved.title ?? "—") artist=\(resolved.artist ?? "—")")
         } catch {
+            log.error("processOne[\(short)]: AI failed — \(error.localizedDescription)")
             update(id: id) {
                 $0.status = .failed
                 $0.phase = .errored
@@ -102,27 +148,54 @@ final class ProcessingEngine {
             return
         }
 
-        let merged = merge(existing: existing, ai: resolved)
+        let merged = merge(existing: read.meta, ai: resolved)
         let preview = describe(merged)
 
-        // 3) Writing tag (or skipping if container unsupported)
+        // --- 3) FETCH cover art (best-effort, time-boxed) -------------------
         update(id: id) {
-            $0.phase = .writing
+            $0.phase = .art
             $0.aiPreview = preview
             $0.resolved = merged
+            $0.detail = "LOOKING UP COVER ART · \(preview.isEmpty ? "—" : preview)"
+        }
+
+        let artwork: Artwork? = await ITunesArtClient.fetchArtwork(
+            artist: merged.artist,
+            album:  merged.album,
+            title:  merged.title,
+            timeoutSeconds: 8
+        )
+        if artwork != nil {
+            log.info("processOne[\(short)]: artwork OK (\(artwork?.data.count ?? 0) bytes)")
+        } else {
+            log.info("processOne[\(short)]: artwork not found")
+        }
+        update(id: id) {
+            $0.artwork = artwork
+        }
+
+        // --- 4) WRITE tag (or skip if container unsupported) ----------------
+        update(id: id) {
+            $0.phase = .writing
+            let artNote = artwork == nil ? "no art" : "with art"
             $0.detail = preview.isEmpty
-                ? "WRITING — NO FIELDS RESOLVED"
-                : "WRITING TAG · \(preview)"
+                ? "WRITING — NO FIELDS RESOLVED (\(artNote))"
+                : "WRITING TAG · \(preview) · \(artNote)"
         }
 
         do {
-            try await writeIfPossible(metadata: merged, to: url)
+            try await writeIfPossible(metadata: merged, artwork: artwork, to: url)
+            log.info("processOne[\(short)]: wrote tag OK")
             update(id: id) {
                 $0.status = .done
                 $0.phase = .finished
-                $0.detail = preview.isEmpty ? "DONE — NO FIELDS RESOLVED" : preview
+                let artBit = artwork == nil ? "" : " · ART"
+                $0.detail = preview.isEmpty
+                    ? "DONE — NO FIELDS RESOLVED\(artBit)"
+                    : "\(preview)\(artBit)"
             }
         } catch RuntimeError.unsupportedFormat(let ext) {
+            log.info("processOne[\(short)]: SKIPPED unsupported writer for .\(ext)")
             update(id: id) {
                 $0.status = .skipped
                 $0.phase = .finished
@@ -130,6 +203,7 @@ final class ProcessingEngine {
                     + (preview.isEmpty ? "" : " — \(preview)")
             }
         } catch {
+            log.error("processOne[\(short)]: write failed — \(error.localizedDescription)")
             update(id: id) {
                 $0.status = .failed
                 $0.phase = .errored
@@ -155,13 +229,15 @@ final class ProcessingEngine {
         return parents.joined(separator: "/")
     }
 
-    private func writeIfPossible(metadata: SongMetadata, to url: URL) async throws {
+    private func writeIfPossible(metadata: SongMetadata,
+                                 artwork: Artwork?,
+                                 to url: URL) async throws {
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "mp3":
-            try ID3Writer.write(metadata: metadata, to: url)
+            try ID3Writer.write(metadata: metadata, artwork: artwork, to: url)
         case "m4a", "mp4", "aac":
-            try await M4AWriter.write(metadata: metadata, to: url)
+            try await M4AWriter.write(metadata: metadata, artwork: artwork, to: url)
         default:
             throw RuntimeError.unsupportedFormat(ext)
         }
@@ -175,7 +251,10 @@ final class ProcessingEngine {
             albumArtist: ai.albumArtist ?? existing.albumArtist,
             year:        ai.year        ?? existing.year,
             genre:       ai.genre       ?? existing.genre,
-            track:       ai.track       ?? existing.track
+            track:       ai.track       ?? existing.track,
+            composer:    ai.composer    ?? existing.composer,
+            copyright:   ai.copyright   ?? existing.copyright,
+            lyrics:      existing.lyrics  // never AI-generated
         )
     }
 
@@ -187,7 +266,8 @@ final class ProcessingEngine {
     }
 
     private func countSet(_ m: SongMetadata) -> Int {
-        [m.title, m.artist, m.album, m.albumArtist, m.year, m.genre, m.track]
+        [m.title, m.artist, m.album, m.albumArtist, m.year, m.genre, m.track,
+         m.composer, m.copyright, m.lyrics]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
             .count

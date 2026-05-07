@@ -1,8 +1,11 @@
 import SwiftUI
+import AppKit
 
 /// Bottom "MINMETA QUEUE" panel — Winamp playlist styling. Each row shows the
-/// filename, the latest status, the resolved metadata once known, and a
-/// per-row spinner / progress bar / elapsed counter for in-flight items.
+/// filename, the latest status, the resolved metadata once known, a per-row
+/// progress bar / phase chip / elapsed counter while in flight, technical
+/// info (bitrate · sample rate · duration), and a cover-art thumbnail once
+/// fetched.
 struct QueuePanelView: View {
     @EnvironmentObject var state: AppState
 
@@ -41,7 +44,7 @@ private struct QueueList: View {
                 }
             }
         }
-        .frame(minHeight: 220, maxHeight: .infinity)
+        .frame(minHeight: 240, maxHeight: .infinity)
         .background(WinampTheme.lcdBg)
         .bevelIn()
     }
@@ -71,12 +74,16 @@ private struct QueueRow: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .top, spacing: 8) {
                 LEDIndicator(item: item, now: now)
-                    .padding(.top, 3)
+                    .padding(.top, 8)
 
                 Text(String(format: "%2d.", index))
                     .font(WinampTheme.lcdFont)
                     .foregroundColor(badgeColor)
                     .frame(width: 24, alignment: .trailing)
+                    .padding(.top, 4)
+
+                CoverArtThumbnail(artwork: item.artwork)
+                    .padding(.top, 2)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(item.url.lastPathComponent)
@@ -91,6 +98,9 @@ private struct QueueRow: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
+                    if let tech = item.tech {
+                        TechInfoLine(tech: tech)
+                    }
                 }
 
                 Spacer(minLength: 0)
@@ -101,12 +111,10 @@ private struct QueueRow: View {
                 }
 
                 StatusBadge(status: item.status)
+                    .padding(.top, 4)
             }
             .padding(.horizontal, 10).padding(.top, 4)
 
-            // Per-row progress bar — only when processing. Shows phase
-            // fraction (READ 25 · AI 65 · TAG 90) plus a live shimmer so it
-            // doesn't look frozen during the long AI step.
             if item.status == .processing {
                 RowProgressBar(phase: item.phase, now: now)
                     .padding(.horizontal, 10).padding(.bottom, 4)
@@ -145,6 +153,88 @@ private struct QueueRow: View {
     }
 }
 
+// MARK: - Cover thumbnail
+
+private struct CoverArtThumbnail: View {
+    let artwork: Artwork?
+
+    var body: some View {
+        Group {
+            if let art = artwork, let img = NSImage(data: art.data) {
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                ZStack {
+                    Rectangle().fill(WinampTheme.lcdBg)
+                    Image(systemName: "music.note")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(WinampTheme.lcdGreenDim.opacity(0.55))
+                }
+            }
+        }
+        .frame(width: 28, height: 28)
+        .clipped()
+        .bevelIn()
+    }
+}
+
+// MARK: - Tech info inline
+
+private struct TechInfoLine: View {
+    let tech: TechInfo
+    var body: some View {
+        HStack(spacing: 4) {
+            if let kbps = tech.bitrateKbps {
+                TechChip(label: "\(kbps)", unit: "KBPS")
+            }
+            if let sr = tech.sampleRateHz {
+                TechChip(label: kHzString(sr), unit: "KHZ")
+            }
+            if let dur = tech.durationSeconds {
+                TechChip(label: durationString(dur), unit: "")
+            }
+            if let ch = tech.channels, ch > 0 {
+                TechChip(label: ch == 1 ? "MONO" : (ch == 2 ? "STEREO" : "\(ch)CH"),
+                         unit: "")
+            }
+            if let codec = tech.codec, !codec.isEmpty {
+                TechChip(label: codec.uppercased(), unit: "")
+            }
+        }
+    }
+
+    private func kHzString(_ hz: Int) -> String {
+        let k = Double(hz) / 1000.0
+        if k == k.rounded() { return String(format: "%.0f", k) }
+        return String(format: "%.1f", k)
+    }
+    private func durationString(_ secs: Double) -> String {
+        let s = Int(secs.rounded())
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+}
+
+private struct TechChip: View {
+    let label: String
+    let unit: String
+    var body: some View {
+        HStack(spacing: 2) {
+            Text(label)
+                .font(WinampTheme.smallFont)
+                .foregroundColor(WinampTheme.lcdGreen)
+            if !unit.isEmpty {
+                Text(unit)
+                    .font(WinampTheme.smallFont)
+                    .foregroundColor(WinampTheme.lcdGreenDim)
+            }
+        }
+        .padding(.horizontal, 4).padding(.vertical, 1)
+        .background(WinampTheme.lcdBg)
+        .bevelIn()
+    }
+}
+
 // MARK: - LED indicator (animated)
 
 private struct LEDIndicator: View {
@@ -155,7 +245,7 @@ private struct LEDIndicator: View {
         Circle()
             .fill(color)
             .frame(width: 8, height: 8)
-            .shadow(color: glowColor.opacity(0.7), radius: 3)
+            .shadow(color: color.opacity(0.7), radius: 3)
             .overlay(
                 Circle()
                     .strokeBorder(Color.black.opacity(0.6), lineWidth: 0.5)
@@ -169,6 +259,7 @@ private struct LEDIndicator: View {
             switch item.phase {
             case .reading: return WinampTheme.lcdGreen
             case .asking:  return WinampTheme.lcdCyan
+            case .art:     return WinampTheme.lcdYellow
             case .writing: return WinampTheme.lcdAmber
             default:       return WinampTheme.lcdGreenDim
             }
@@ -179,11 +270,8 @@ private struct LEDIndicator: View {
         }
     }
 
-    private var glowColor: Color { color }
-
     private var opacity: Double {
         guard item.status == .processing else { return 1.0 }
-        // 1 Hz pulse via the shared TimelineView clock.
         let t = now.timeIntervalSinceReferenceDate
         return 0.55 + 0.45 * (sin(t * 6.28) * 0.5 + 0.5)
     }
@@ -206,6 +294,7 @@ private struct PhaseChip: View {
         case .waiting:  return WinampTheme.lcdGreenDim
         case .reading:  return WinampTheme.lcdGreen
         case .asking:   return WinampTheme.lcdCyan
+        case .art:      return WinampTheme.lcdYellow
         case .writing:  return WinampTheme.lcdAmber
         case .finished: return WinampTheme.lcdGreen
         case .errored:  return WinampTheme.lcdRed
@@ -256,9 +345,7 @@ private struct RowProgressBar: View {
                                                   fillTip],
                                          startPoint: .leading, endPoint: .trailing))
                     .frame(width: geo.size.width * frac)
-                // A thin shimmer that travels across the filled portion so
-                // long-running phases (the AI call) don't look frozen.
-                if phase == .asking || phase == .reading {
+                if phase == .asking || phase == .reading || phase == .art {
                     let t = now.timeIntervalSinceReferenceDate
                     let shimmerX = (sin(t * 1.6) * 0.5 + 0.5) * (geo.size.width * frac)
                     Rectangle()
@@ -277,6 +364,7 @@ private struct RowProgressBar: View {
         switch phase {
         case .reading: return WinampTheme.lcdGreen
         case .asking:  return WinampTheme.lcdCyan
+        case .art:     return WinampTheme.lcdYellow
         case .writing: return WinampTheme.lcdAmber
         default:       return WinampTheme.lcdGreen
         }

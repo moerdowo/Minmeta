@@ -43,24 +43,30 @@ struct OpenAIClient {
            "Artist - Album - 01 - Title". Strip noise like "[Official]", "(HD)", \
            "320kbps", "lyrics", trailing release tags, and file extensions.
         2. Prefer existing metadata only when it is internally consistent and matches \
-           a known release. Fix obvious errors (e.g. mojibake, ALL CAPS noise, \
-           "Track 1" placeholders).
+           a known release. Fix obvious errors (mojibake, ALL CAPS noise, "Track 1" \
+           placeholders).
         3. Return CANONICAL release values — artist as credited on the official \
            release, album as the original studio album when applicable (not greatest \
            hits / compilations / soundtracks unless the track only exists there).
-        4. Year: 4-digit year of the original studio release, not re-issues.
-        5. Genre: a single common label ("Rock", "Pop", "Hip-Hop", "Jazz", \
+        4. year: 4-digit year of the original studio release, not re-issues.
+        5. genre: a single common label ("Rock", "Pop", "Hip-Hop", "Jazz", \
            "Electronic", "R&B", "Classical", "Country", "Metal", "Folk", "Reggae", \
            "Soundtrack"). Avoid hyper-specific subgenres unless very well known.
-        6. Track: plain integer string when known with high confidence. No "01/12".
+        6. track: plain integer string when known with high confidence. No "01/12".
         7. album_artist: usually equals artist; for compilations use "Various Artists".
-        8. If a field is unknown or your confidence is low (<70%), return an empty \
-           string for that field. Do NOT invent or guess plausible-sounding fakes.
-        9. Names must use proper title case as on the official release. Preserve \
-           original-language characters and diacritics.
+        8. composer: the song's primary writer(s) as credited on the release \
+           (separate multiple writers with " / "). For pop/rock that's the songwriter; \
+           for classical it's the composer. Leave empty if uncertain.
+        9. copyright: the © line as it appears on the release, e.g. \
+           "© 2013 Daft Life Limited, under exclusive license to Columbia Records". \
+           Leave empty if uncertain. Do not fabricate label names.
+        10. If a field is unknown or your confidence is low (<70%), return an empty \
+            string for that field. Do NOT invent or guess plausible-sounding fakes.
+        11. Names must use proper title case as on the official release. Preserve \
+            original-language characters and diacritics.
 
         OUTPUT: ONLY a JSON object, no prose, with this exact schema and key order:
-        {"title":"","artist":"","album":"","album_artist":"","year":"","genre":"","track":""}
+        {"title":"","artist":"","album":"","album_artist":"","year":"","genre":"","track":"","composer":"","copyright":""}
         """
 
         let existingJSON = (try? String(data: JSONEncoder().encode(existing),
@@ -106,7 +112,7 @@ struct OpenAIClient {
         return raw.normalized()
     }
 
-    /// Sanity-checks the API key + base URL by hitting `/models` (or any cheap GET).
+    /// Sanity-checks the API key + base URL by hitting `/models`.
     /// Returns nil on success or a human-readable error message on failure.
     func verify() async -> String? {
         let endpoint = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) +
@@ -143,6 +149,8 @@ struct OpenAIClient {
         var year: String?
         var genre: String?
         var track: String?
+        var composer: String?
+        var copyright: String?
 
         func normalized() -> SongMetadata {
             func clean(_ s: String?) -> String? {
@@ -158,7 +166,10 @@ struct OpenAIClient {
                 albumArtist: clean(album_artist),
                 year:        clean(year),
                 genre:       clean(genre),
-                track:       clean(track)
+                track:       clean(track),
+                composer:    clean(composer),
+                copyright:   clean(copyright),
+                lyrics:      nil
             )
         }
     }

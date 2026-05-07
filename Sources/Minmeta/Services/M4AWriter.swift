@@ -19,7 +19,9 @@ enum M4AWriter {
         }
     }
 
-    static func write(metadata: SongMetadata, to url: URL) async throws {
+    static func write(metadata: SongMetadata,
+                      artwork: Artwork?,
+                      to url: URL) async throws {
         let asset = AVURLAsset(url: url)
 
         guard let session = AVAssetExportSession(asset: asset,
@@ -33,7 +35,7 @@ enum M4AWriter {
         session.outputURL = tmpURL
         session.outputFileType = .m4a
         session.shouldOptimizeForNetworkUse = true
-        session.metadata = buildMetadata(from: metadata)
+        session.metadata = buildMetadata(from: metadata, artwork: artwork)
 
         await session.export()
 
@@ -47,17 +49,17 @@ enum M4AWriter {
         }
 
         do {
-            // Atomic replace so a crash mid-write doesn't leave a half-baked file.
             _ = try FileManager.default.replaceItemAt(url, withItemAt: tmpURL)
         } catch {
             throw WriteError.replaceFailed(error.localizedDescription)
         }
     }
 
-    private static func buildMetadata(from m: SongMetadata) -> [AVMetadataItem] {
+    private static func buildMetadata(from m: SongMetadata,
+                                      artwork: Artwork?) -> [AVMetadataItem] {
         var items: [AVMetadataItem] = []
 
-        func add(_ key: AVMetadataIdentifier, _ value: String?) {
+        func addText(_ key: AVMetadataIdentifier, _ value: String?) {
             guard let v = value?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !v.isEmpty else { return }
             let item = AVMutableMetadataItem()
@@ -67,14 +69,17 @@ enum M4AWriter {
             items.append(item)
         }
 
-        add(.iTunesMetadataSongName,         m.title)
-        add(.iTunesMetadataArtist,           m.artist)
-        add(.iTunesMetadataAlbum,            m.album)
-        add(.iTunesMetadataAlbumArtist,      m.albumArtist)
-        add(.iTunesMetadataReleaseDate,      m.year)
-        add(.iTunesMetadataUserGenre,        m.genre)
+        addText(.iTunesMetadataSongName,        m.title)
+        addText(.iTunesMetadataArtist,          m.artist)
+        addText(.iTunesMetadataAlbum,           m.album)
+        addText(.iTunesMetadataAlbumArtist,     m.albumArtist)
+        addText(.iTunesMetadataReleaseDate,     m.year)
+        addText(.iTunesMetadataUserGenre,       m.genre)
+        addText(.iTunesMetadataComposer,        m.composer)
+        addText(.iTunesMetadataCopyright,       m.copyright)
+        addText(.iTunesMetadataLyrics,          m.lyrics)
 
-        // Track number gets a dedicated number-typed atom when parseable.
+        // Track number — dedicated number-typed atom when parseable.
         if let trk = m.track,
            let n = Int(trk.trimmingCharacters(in: .whitespacesAndNewlines)),
            n > 0 {
@@ -84,10 +89,19 @@ enum M4AWriter {
             items.append(item)
         }
 
-        // Mirror into the more portable common keys for broader reader support.
-        add(.commonIdentifierTitle,        m.title)
-        add(.commonIdentifierArtist,       m.artist)
-        add(.commonIdentifierAlbumName,    m.album)
+        // Cover art atom (covr).
+        if let art = artwork {
+            let item = AVMutableMetadataItem()
+            item.identifier = .iTunesMetadataCoverArt
+            item.value = art.data as NSData
+            item.dataType = "com.apple.metadata.datatype.JPEG"
+            items.append(item)
+        }
+
+        // Mirror into common keys for broader reader support.
+        addText(.commonIdentifierTitle,        m.title)
+        addText(.commonIdentifierArtist,       m.artist)
+        addText(.commonIdentifierAlbumName,    m.album)
 
         return items
     }

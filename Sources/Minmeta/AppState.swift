@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import Combine
+import OSLog
+
+let log = Logger(subsystem: "id.moerdowo.minmeta", category: "engine")
 
 @MainActor
 final class AppState: ObservableObject {
@@ -63,6 +66,7 @@ final class AppState: ObservableObject {
         let existingPaths = Set(queue.map { $0.url.path })
         let deduped = newItems.filter { !existingPaths.contains($0.url.path) }
         queue.append(contentsOf: deduped)
+        log.info("enqueue: dropped=\(urls.count) found=\(newItems.count) added=\(deduped.count) totalQueue=\(self.queue.count)")
         startProcessingIfNeeded()
     }
 
@@ -116,6 +120,8 @@ struct QueueItem: Identifiable, Equatable {
     var startedAt: Date? = nil
     var detail: String = ""
     var resolved: SongMetadata? = nil
+    var artwork: Artwork? = nil
+    var tech: TechInfo? = nil
     /// Short preview of the metadata the model proposed, kept around so the
     /// queue can keep showing it while the writer runs and after a skip.
     var aiPreview: String? = nil
@@ -134,6 +140,7 @@ struct QueueItem: Identifiable, Equatable {
         case waiting   // queued but not yet started
         case reading   // pulling existing tags off disk
         case asking    // calling the model
+        case art       // looking up album artwork
         case writing   // committing tags to file
         case finished  // wrapped up successfully or as a deliberate skip
         case errored   // unrecoverable failure
@@ -143,6 +150,7 @@ struct QueueItem: Identifiable, Equatable {
             case .waiting:  return "WAIT"
             case .reading:  return "READ"
             case .asking:   return "AI"
+            case .art:      return "ART"
             case .writing:  return "TAG"
             case .finished: return "OK"
             case .errored:  return "X"
@@ -152,8 +160,9 @@ struct QueueItem: Identifiable, Equatable {
         var fraction: Double {
             switch self {
             case .waiting:  return 0.05
-            case .reading:  return 0.25
-            case .asking:   return 0.65
+            case .reading:  return 0.20
+            case .asking:   return 0.55
+            case .art:      return 0.75
             case .writing:  return 0.90
             case .finished: return 1.00
             case .errored:  return 1.00
@@ -164,6 +173,8 @@ struct QueueItem: Identifiable, Equatable {
     static func == (l: QueueItem, r: QueueItem) -> Bool { l.id == r.id }
 }
 
+/// Text fields written into the file's tag (ID3v2 / iTunes atoms). Pure data —
+/// what we send to the model and what the writers consume.
 struct SongMetadata: Codable, Equatable {
     var title: String?
     var artist: String?
@@ -172,4 +183,26 @@ struct SongMetadata: Codable, Equatable {
     var year: String?
     var genre: String?
     var track: String?
+    var composer: String?
+    var copyright: String?
+    /// Unsynchronized full lyrics. Optional — the AI prompt does NOT request
+    /// these (lyrics are copyrighted material that we shouldn't conjure), but
+    /// the schema is here so a future lyrics-source plug-in can populate it.
+    var lyrics: String?
+}
+
+struct Artwork: Equatable {
+    var data: Data
+    var mime: String   // "image/jpeg" or "image/png"
+    var source: String // human-readable provenance, e.g. "iTunes 600x600"
+}
+
+/// Read-only technical info pulled off the audio file itself. Never written
+/// back — these are properties of the audio bitstream.
+struct TechInfo: Equatable {
+    var bitrateKbps: Int?
+    var sampleRateHz: Int?
+    var durationSeconds: Double?
+    var channels: Int?
+    var codec: String?
 }

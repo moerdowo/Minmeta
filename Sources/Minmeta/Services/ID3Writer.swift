@@ -1,13 +1,20 @@
 import Foundation
 
-/// Minimal ID3v2.3 tag writer for MP3 files. Replaces any existing ID3v2 tag at the
-/// start of the file with a new tag containing the supplied frames. Audio data
-/// (and any trailing ID3v1 tag) is preserved.
+/// Minimal ID3v2.3 tag writer for MP3 files. Replaces any existing ID3v2 tag at
+/// the start of the file with a new tag containing the supplied frames. Audio
+/// data (and any trailing ID3v1 tag) is preserved.
+///
+/// Supported frames (ID3v2.3):
+///   TIT2 title · TPE1 artist · TALB album · TPE2 album artist
+///   TYER year  · TCON genre  · TRCK track · TCOM composer
+///   TCOP copyright · USLT lyrics · APIC attached picture
 enum ID3Writer {
 
     enum WriteError: Error { case readFailed, writeFailed }
 
-    static func write(metadata: SongMetadata, to url: URL) throws {
+    static func write(metadata: SongMetadata,
+                      artwork: Artwork?,
+                      to url: URL) throws {
         let original = try Data(contentsOf: url)
         let audioStart = existingTagSize(in: original)
         let audioData = original.subdata(in: audioStart..<original.count)
@@ -20,6 +27,12 @@ enum ID3Writer {
         appendTextFrame(id: "TYER", text: metadata.year,        into: &frames)
         appendTextFrame(id: "TCON", text: metadata.genre,       into: &frames)
         appendTextFrame(id: "TRCK", text: metadata.track,       into: &frames)
+        appendTextFrame(id: "TCOM", text: metadata.composer,    into: &frames)
+        appendTextFrame(id: "TCOP", text: metadata.copyright,   into: &frames)
+        appendLyricsFrame(text: metadata.lyrics,                into: &frames)
+        if let art = artwork {
+            appendPictureFrame(artwork: art, into: &frames)
+        }
 
         // Padding allows future tag growth without rewrites.
         let padding = Data(count: 256)
@@ -35,6 +48,8 @@ enum ID3Writer {
         try output.write(to: url, options: .atomic)
     }
 
+    // MARK: - Text frames
+
     private static func appendTextFrame(id: String, text: String?, into data: inout Data) {
         guard let raw = text?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
@@ -43,19 +58,69 @@ enum ID3Writer {
         // Encoding 0x01 = UTF-16 with BOM. Terminator is two zero bytes.
         var payload = Data()
         payload.append(0x01)
-        payload.append(contentsOf: [0xFF, 0xFE]) // little-endian BOM
-        for scalar in raw.unicodeScalars {
-            for unit in String(scalar).utf16 {
-                payload.append(UInt8(unit & 0xFF))
-                payload.append(UInt8((unit >> 8) & 0xFF))
-            }
-        }
+        payload.append(utf16WithBOM(raw))
         payload.append(contentsOf: [0x00, 0x00])
 
-        data.append(contentsOf: Array(id.utf8))
-        data.append(uint32BE(UInt32(payload.count)))
-        data.append(contentsOf: [0x00, 0x00])    // frame flags
+        appendFrameHeader(id: id, payloadSize: payload.count, into: &data)
         data.append(payload)
+    }
+
+    // MARK: - USLT (Unsynchronized lyrics)
+    //
+    // Frame body: <text encoding> <language (3 bytes)> <content descriptor null-terminated> <lyrics>
+
+    private static func appendLyricsFrame(text: String?, into data: inout Data) {
+        guard let raw = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return }
+
+        var payload = Data()
+        payload.append(0x01)                              // encoding: UTF-16
+        payload.append(contentsOf: Array("eng".utf8))     // language
+        // content descriptor (empty) + null terminator (UTF-16)
+        payload.append(contentsOf: [0xFF, 0xFE, 0x00, 0x00])
+        payload.append(utf16WithBOM(raw))
+
+        appendFrameHeader(id: "USLT", payloadSize: payload.count, into: &data)
+        data.append(payload)
+    }
+
+    // MARK: - APIC (Attached picture)
+    //
+    // Frame body: <text encoding> <MIME null-terminated ascii> <picture type (1B)>
+    //             <description null-terminated> <picture data>
+
+    private static func appendPictureFrame(artwork: Artwork, into data: inout Data) {
+        let mime = artwork.mime.isEmpty ? "image/jpeg" : artwork.mime
+        var payload = Data()
+        payload.append(0x00)                            // encoding: ISO-8859-1 (for description)
+        payload.append(contentsOf: Array(mime.utf8))    // MIME
+        payload.append(0x00)                            // null terminator
+        payload.append(0x03)                            // picture type 0x03 = front cover
+        payload.append(0x00)                            // description: empty + null
+        payload.append(artwork.data)                    // picture bytes
+
+        appendFrameHeader(id: "APIC", payloadSize: payload.count, into: &data)
+        data.append(payload)
+    }
+
+    // MARK: - Helpers
+
+    private static func appendFrameHeader(id: String, payloadSize: Int, into data: inout Data) {
+        data.append(contentsOf: Array(id.utf8))
+        data.append(uint32BE(UInt32(payloadSize)))
+        data.append(contentsOf: [0x00, 0x00])           // frame flags
+    }
+
+    private static func utf16WithBOM(_ s: String) -> Data {
+        var out = Data()
+        out.append(contentsOf: [0xFF, 0xFE])            // little-endian BOM
+        for scalar in s.unicodeScalars {
+            for unit in String(scalar).utf16 {
+                out.append(UInt8(unit & 0xFF))
+                out.append(UInt8((unit >> 8) & 0xFF))
+            }
+        }
+        return out
     }
 
     private static func uint32BE(_ value: UInt32) -> Data {
