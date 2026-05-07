@@ -118,11 +118,6 @@ runs `swift build -c release`, and produces an ad-hoc-signed
   never leave the machine.**
 - Album art is downloaded from Apple's iTunes CDN (whatever URL the search
   result links to) and embedded locally.
-- Diagnostic events go to `OSLog`, subsystem `id.moerdowo.minmeta`. View
-  them with:
-  ```bash
-  log show --predicate 'subsystem == "id.moerdowo.minmeta"' --style compact --last 5m
-  ```
 
 ## Layout
 
