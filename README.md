@@ -145,14 +145,6 @@ Tools/
 
 ## Notes
 
-- Style inspiration: classic Winamp 2.x — title bars with control dots, LCD
-  green-on-black readouts, beveled buttons, monospaced pixel text. The icon
-  shape is a 22.37 % rounded-rect (close enough to Apple's continuous-corner
-  squircle that it's indistinguishable at icon resolutions).
-- Concurrency is a worker-pool of 3 tasks. `processOne` has a `defer` rescue
-  that forces any item still in `.processing` after the function returns to
-  `.failed` with a self-explanatory note — the queue never gets visually
-  stuck.
 - Unsupported containers (FLAC / WAV / OGG) are intentionally `SKIPPED`, not
   `FAILED`; the metadata suggestion is still surfaced in the row's detail
   line for reference.
