@@ -2,24 +2,39 @@ import Foundation
 import SwiftUI
 import OSLog
 
-/// Drives the queue: pulls pending items, asks the model for missing fields,
-/// fetches album art, merges with what we read off-disk, and writes the result
-/// back into the file.
+/// Drives the queue: pulls pending items, looks up canonical metadata for
+/// each track, fetches album art, merges with on-disk tags, and writes the
+/// result back into the file.
+///
+/// Resolution strategy (per file):
+///   1. Read existing tags + technical info via AVFoundation.
+///   2. Extract artist / album / title hints from the filename + 1–2
+///      parent folder names + existing tags.
+///   3. Search the iTunes Search API. If the first hit's artist+title
+///      match the hints with score ≥ 4, **trust iTunes** as the primary
+///      source — title / artist / album / year / genre / track + cover art.
+///   4. If iTunes scored < 4 AND an AI key is configured, fall back to
+///      OpenAI to interpret the filename (good for messy names + non-
+///      catalog music). Then re-search iTunes with the AI result for
+///      art and any backfill.
+///   5. If neither path produced metadata, mark the row SKIPPED.
 ///
 /// Reliability notes:
-/// - Uses a worker-pool pattern (N workers each pulling next pending) — easier
-///   to reason about than a producer/consumer task group.
-/// - processOne() has a `defer` that guarantees the item leaves `.processing`
-///   even if a path is missed — so the queue never gets stuck visually.
-/// - Every state transition emits an OSLog line so a stuck queue is debuggable
-///   from Console.app: filter on `subsystem:id.moerdowo.minmeta`.
+/// - Worker-pool of N tasks each pulling next pending — easier to reason
+///   about than a producer/consumer task group.
+/// - processOne() has a `defer` that guarantees the item leaves
+///   `.processing` even if a path is missed — the queue can never get
+///   visually stuck.
+/// - Every state transition emits an OSLog line; filter on
+///   `subsystem:id.moerdowo.minmeta` from Console.app to debug a stuck
+///   queue.
 @MainActor
 final class ProcessingEngine {
     private weak var state: AppState?
     private var task: Task<Void, Never>?
 
-    /// Number of files processed in parallel.
     private let concurrency = 3
+    private let confidentScore = 4
 
     init(state: AppState) { self.state = state }
 
@@ -60,8 +75,6 @@ final class ProcessingEngine {
         }
     }
 
-    /// Atomically claims the next pending item by flipping it to `.processing`.
-    /// Returns the item's id, or nil if no pending work remains.
     private func takeNextPendingId() -> UUID? {
         guard let state = state,
               let idx = state.queue.firstIndex(where: { $0.status == .pending })
@@ -87,9 +100,6 @@ final class ProcessingEngine {
         let url = state.queue[initialIdx].url
         log.info("processOne[\(short)]: \(url.lastPathComponent)")
 
-        // GUARANTEE the item leaves .processing even if something below
-        // returns/throws past our handlers. A "stuck pending/working" row is
-        // the worst UX bug we can ship — this defer is the safety net.
         defer {
             update(id: id) { item in
                 if item.status == .processing {
@@ -103,106 +113,132 @@ final class ProcessingEngine {
             }
         }
 
-        // --- 1) READ existing tags + tech info -------------------------------
+        // --- 1) READ existing tags + tech info ------------------------------
         update(id: id) {
             $0.phase = .reading
             $0.detail = "READING EXISTING TAGS & TECH INFO…"
         }
         state.statusMessage = "WORKING · " + url.lastPathComponent
         let read = await MetadataReader.read(url: url)
-        let foundCount = countSet(read.meta)
-        log.info("processOne[\(short)]: read tags=\(foundCount) bitrate=\(read.tech.bitrateKbps ?? 0)kbps sr=\(read.tech.sampleRateHz ?? 0)Hz dur=\(Int(read.tech.durationSeconds ?? 0))s")
+        log.info("processOne[\(short)]: read tags=\(self.countSet(read.meta)) bitrate=\(read.tech.bitrateKbps ?? 0)kbps")
+
+        update(id: id) { $0.tech = read.tech }
+
+        // --- 2) iTunes primary lookup ---------------------------------------
+        // Hints come from existing tags first, then filename + parent folders.
+        let hints = extractHints(url: url, existing: read.meta)
+        log.info("processOne[\(short)]: hints artist=\(hints.artist ?? "—") title=\(hints.title ?? "—") album=\(hints.album ?? "—")")
 
         update(id: id) {
-            $0.tech = read.tech
+            $0.phase = .art
+            $0.detail = "SEARCHING ITUNES · " + (hints.title ?? hints.artist ?? "—")
         }
 
-        // --- 2) ASK the model -----------------------------------------------
-        update(id: id) {
-            $0.phase = .asking
-            let foundLine = foundCount == 0
-                ? "NO EXISTING TAGS"
-                : "\(foundCount) TAG\(foundCount == 1 ? "" : "S") ON DISK"
-            $0.detail = "ASKING \(state.model.uppercased()) · \(foundLine)"
+        let lookup = await ITunesArtClient.lookup(
+            artist: hints.artist,
+            album:  hints.album,
+            title:  hints.title,
+            timeoutSeconds: 8
+        )
+        if let lookup = lookup {
+            log.info("processOne[\(short)]: iTunes score=\(lookup.score) album=\(lookup.albumName ?? "—")")
+        } else {
+            log.info("processOne[\(short)]: iTunes no result")
         }
 
-        let client = OpenAIClient(apiKey: state.apiKey,
-                                  baseURL: state.baseURL,
-                                  model: state.model)
+        let confident = (lookup?.score ?? 0) >= confidentScore
 
-        let resolved: SongMetadata
-        do {
-            resolved = try await client.completeMetadata(
-                filename: url.lastPathComponent,
-                relativePath: relativePath(for: url),
-                existing: read.meta
-            )
-            log.info("processOne[\(short)]: AI returned title=\(resolved.title ?? "—") artist=\(resolved.artist ?? "—")")
-        } catch {
-            log.error("processOne[\(short)]: AI failed — \(error.localizedDescription)")
+        // --- 3) Decide path: trust iTunes, AI fallback, or skip -------------
+        let aiAvailable = !state.apiKey.isEmpty
+        var finalMeta: SongMetadata = read.meta
+        var finalArt: Artwork? = nil
+        var sourceTag = ""
+
+        if confident, let l = lookup {
+            // Path A — iTunes is good enough on its own.
+            finalMeta = applyITunes(read.meta, l)
+            finalArt = l.artwork
+            sourceTag = "ITUNES"
+        } else if aiAvailable {
+            // Path B — iTunes wasn't sure. Ask the model to interpret the
+            // filename (handles messy names + non-catalog music). Then
+            // search iTunes a second time with the AI's canonical artist /
+            // title for cleaner art and any final backfill.
             update(id: id) {
-                $0.status = .failed
-                $0.phase = .errored
-                $0.detail = "AI FAILED — \(error.localizedDescription)"
+                $0.phase = .asking
+                $0.detail = "NO ITUNES MATCH · ASKING \(state.model.uppercased())"
+            }
+
+            let client = OpenAIClient(apiKey: state.apiKey,
+                                      baseURL: state.baseURL,
+                                      model: state.model)
+            do {
+                let aiResolved = try await client.completeMetadata(
+                    filename: url.lastPathComponent,
+                    relativePath: relativePath(for: url),
+                    existing: read.meta
+                )
+                log.info("processOne[\(short)]: AI returned title=\(aiResolved.title ?? "—")")
+
+                let aiMerged = mergeAI(existing: read.meta, ai: aiResolved)
+
+                update(id: id) {
+                    $0.phase = .art
+                    $0.detail = "AI DONE · LOOKING UP ITUNES ART · \(self.describe(aiMerged))"
+                }
+
+                let secondLookup = await ITunesArtClient.lookup(
+                    artist: aiMerged.artist,
+                    album:  aiMerged.album,
+                    title:  aiMerged.title,
+                    timeoutSeconds: 8
+                )
+
+                finalMeta = backfill(aiMerged, with: secondLookup)
+                finalArt = secondLookup?.artwork ?? lookup?.artwork
+                sourceTag = "AI"
+            } catch {
+                log.error("processOne[\(short)]: AI failed — \(error.localizedDescription)")
+                update(id: id) {
+                    $0.status = .failed
+                    $0.phase = .errored
+                    $0.detail = "AI FAILED — \(error.localizedDescription)"
+                }
+                return
+            }
+        } else {
+            // Path C — no AI configured and iTunes couldn't identify the
+            // track. Nothing to write. Skip with a useful note.
+            log.info("processOne[\(short)]: SKIPPED — no iTunes match and no AI key")
+            update(id: id) {
+                $0.status = .skipped
+                $0.phase = .finished
+                $0.detail = "NO ITUNES MATCH · SET API KEY IN CFG TO ENABLE AI FALLBACK"
+                $0.aiPreview = self.describe(read.meta)
             }
             return
         }
 
-        let aiMerged = merge(existing: read.meta, ai: resolved)
+        let preview = describe(finalMeta)
+        let artNote = finalArt == nil ? "no art" : "with art"
 
-        // --- 3) iTunes lookup (artwork + canonical-field backfill) ---------
-        // The model is told to leave fields empty when uncertain; iTunes'
-        // track record fills the gap for catalog music. We only ever fill
-        // empties — values the model returned are kept as-is.
-        update(id: id) {
-            $0.phase = .art
-            $0.aiPreview = describe(aiMerged)
-            $0.resolved = aiMerged
-            let pv = describe(aiMerged)
-            $0.detail = "LOOKING UP ITUNES · \(pv.isEmpty ? "—" : pv)"
-        }
-
-        let lookup = await ITunesArtClient.lookup(
-            artist: aiMerged.artist,
-            album:  aiMerged.album,
-            title:  aiMerged.title,
-            timeoutSeconds: 8
-        )
-        if let lookup = lookup {
-            log.info("processOne[\(short)]: iTunes match album=\(lookup.albumName ?? "—") year=\(lookup.year ?? "—") art=\(lookup.artwork == nil ? "no" : "yes")")
-        } else {
-            log.info("processOne[\(short)]: iTunes no match")
-        }
-
-        let merged = backfill(aiMerged, with: lookup)
-        let preview = describe(merged)
-        let artwork = lookup?.artwork
-
-        update(id: id) {
-            $0.artwork = artwork
-            $0.resolved = merged
-            $0.aiPreview = preview
-        }
-
-        // --- 4) WRITE tag (or skip if container unsupported) ----------------
+        // --- 4) WRITE -------------------------------------------------------
         update(id: id) {
             $0.phase = .writing
-            let artNote = artwork == nil ? "no art" : "with art"
-            $0.detail = preview.isEmpty
-                ? "WRITING — NO FIELDS RESOLVED (\(artNote))"
-                : "WRITING TAG · \(preview) · \(artNote)"
+            $0.aiPreview = preview
+            $0.resolved = finalMeta
+            $0.artwork = finalArt
+            $0.detail = "WRITING TAG · \(sourceTag) · \(preview) · \(artNote)"
         }
 
         do {
-            try await writeIfPossible(metadata: merged, artwork: artwork, to: url)
-            log.info("processOne[\(short)]: wrote tag OK")
+            try await writeIfPossible(metadata: finalMeta, artwork: finalArt, to: url)
+            log.info("processOne[\(short)]: wrote tag OK (\(sourceTag))")
             update(id: id) {
                 $0.status = .done
                 $0.phase = .finished
-                let artBit = artwork == nil ? "" : " · ART"
-                $0.detail = preview.isEmpty
-                    ? "DONE — NO FIELDS RESOLVED\(artBit)"
-                    : "\(preview)\(artBit)"
+                let artBit = finalArt == nil ? "" : " · ART"
+                $0.detail = "\(sourceTag) · \(preview)\(artBit)"
             }
         } catch RuntimeError.unsupportedFormat(let ext) {
             log.info("processOne[\(short)]: SKIPPED unsupported writer for .\(ext)")
@@ -222,9 +258,6 @@ final class ProcessingEngine {
         }
     }
 
-    /// Mutates the queue item with the given id in-place. The closure runs on
-    /// the main actor and the assignment back into `state.queue` triggers the
-    /// SwiftUI republish so each phase transition is visible immediately.
     private func update(id: UUID, _ mutate: (inout QueueItem) -> Void) {
         guard let state = state,
               let i = state.queue.firstIndex(where: { $0.id == id }) else { return }
@@ -233,10 +266,84 @@ final class ProcessingEngine {
         state.queue[i] = item
     }
 
-    /// Folder context that helps the model anchor "Artist/Album/01 Track.mp3" layouts.
+    /// 1–2 parent folder names that often hold "Artist/Album" structure.
     private func relativePath(for url: URL) -> String {
         let parents = url.deletingLastPathComponent().pathComponents.suffix(2)
         return parents.joined(separator: "/")
+    }
+
+    /// Pull artist / title / album hints from existing tags first, then from
+    /// the filename and 1–2 parent folder names. Used to seed iTunes search.
+    private func extractHints(url: URL, existing: SongMetadata) -> SongMetadata {
+        // Existing tags trump everything when both artist+title are set.
+        if let a = existing.artist, !a.isEmpty,
+           let t = existing.title,  !t.isEmpty {
+            return SongMetadata(title: t, artist: a, album: existing.album)
+        }
+
+        // Strip extension, common YouTube-style noise, bracketed video IDs.
+        var name = (url.lastPathComponent as NSString).deletingPathExtension
+        let noise = #"\s*[\(\[](Official(\s+(Music\s+)?(Audio|Video|Lyric Video|Music Video))?|HD|1080p|4K|Audio|Lyrics|Live|Remastered|Visualizer)[^\)\]]*[\)\]]"#
+        name = name.replacingOccurrences(of: noise,
+                                          with: "",
+                                          options: [.regularExpression, .caseInsensitive])
+        // Trailing 8+ char alphanumeric IDs in brackets, e.g. YouTube IDs.
+        name = name.replacingOccurrences(of: #"\s*\[[A-Za-z0-9_-]{8,}\]"#,
+                                          with: "",
+                                          options: .regularExpression)
+        name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Try common dash-separated patterns. " - " is the usual separator,
+        // but some files use just "-" or "_".
+        var parts = name.components(separatedBy: " - ")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if parts.count < 2 {
+            parts = name.components(separatedBy: "_")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+
+        var artist: String? = existing.artist
+        var title:  String? = existing.title
+        var album:  String? = existing.album
+
+        if parts.count >= 2 {
+            // Drop a leading track number "01", "01.", "Track 01" if present.
+            let leadIsTrackNum = parts[0].range(of: #"^(track\s+)?\d+\.?$"#,
+                                                options: [.regularExpression, .caseInsensitive]) != nil
+            let body = leadIsTrackNum ? Array(parts.dropFirst()) : parts
+            if body.count >= 2 {
+                if artist == nil { artist = body[0] }
+                if title == nil  { title  = body.dropFirst().joined(separator: " - ") }
+            } else if body.count == 1, title == nil {
+                title = body[0]
+            }
+        } else if title == nil {
+            title = name
+        }
+
+        // Folder context: "<Artist>/<Album>/file.mp3" is a common layout —
+        // populate album/artist from the last two path components.
+        if album == nil || artist == nil {
+            let parents = url.deletingLastPathComponent().pathComponents
+            if parents.count >= 2 {
+                let albumFolder  = parents[parents.count - 1]
+                let artistFolder = parents[parents.count - 2]
+                if album == nil, !albumFolder.isEmpty,
+                   !["Music", "Downloads", "Desktop", "iTunes Media", "Songs"]
+                       .contains(albumFolder) {
+                    album = albumFolder
+                }
+                if artist == nil, !artistFolder.isEmpty,
+                   !["Music", "Downloads", "Desktop", "iTunes Media", "Songs"]
+                       .contains(artistFolder) {
+                    artist = artistFolder
+                }
+            }
+        }
+
+        return SongMetadata(title: title, artist: artist, album: album)
     }
 
     private func writeIfPossible(metadata: SongMetadata,
@@ -253,7 +360,27 @@ final class ProcessingEngine {
         }
     }
 
-    private func merge(existing: SongMetadata, ai: SongMetadata) -> SongMetadata {
+    /// Apply iTunes match as the primary source, keeping any non-empty
+    /// existing-disk values that iTunes doesn't itself provide (composer,
+    /// copyright, lyrics).
+    private func applyITunes(_ existing: SongMetadata,
+                             _ lookup: ITunesArtClient.Match) -> SongMetadata {
+        SongMetadata(
+            title:       lookup.trackName   ?? existing.title,
+            artist:      lookup.artistName  ?? existing.artist,
+            album:       lookup.albumName   ?? existing.album,
+            albumArtist: lookup.artistName  ?? existing.albumArtist,
+            year:        lookup.year        ?? existing.year,
+            genre:       lookup.genre       ?? existing.genre,
+            track:       lookup.trackNumber ?? existing.track,
+            composer:    existing.composer,
+            copyright:   existing.copyright,
+            lyrics:      existing.lyrics
+        )
+    }
+
+    /// AI values win over what's on disk when both are present.
+    private func mergeAI(existing: SongMetadata, ai: SongMetadata) -> SongMetadata {
         SongMetadata(
             title:       ai.title       ?? existing.title,
             artist:      ai.artist      ?? existing.artist,
@@ -264,13 +391,12 @@ final class ProcessingEngine {
             track:       ai.track       ?? existing.track,
             composer:    ai.composer    ?? existing.composer,
             copyright:   ai.copyright   ?? existing.copyright,
-            lyrics:      existing.lyrics  // never AI-generated
+            lyrics:      existing.lyrics
         )
     }
 
-    /// Fills empty fields on `m` with values from the iTunes lookup. Never
-    /// overrides a field the model already provided — iTunes is a backstop,
-    /// not the source of truth.
+    /// Fill empty fields on `m` with values from the iTunes lookup. Never
+    /// overrides a field already set — iTunes is a backstop here.
     private func backfill(_ m: SongMetadata,
                           with lookup: ITunesArtClient.Match?) -> SongMetadata {
         guard let lookup = lookup else { return m }

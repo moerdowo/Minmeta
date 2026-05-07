@@ -12,6 +12,14 @@ import Foundation
 enum ITunesArtClient {
 
     struct Match {
+        /// Confidence score from the artist+title fuzzy match. 0 = no overlap
+        /// with the hints we sent in (either nothing was sent, or iTunes
+        /// returned wildly different data); 4 = one field matched exactly OR
+        /// both matched as substring; 8 = both matched exactly.
+        ///
+        /// The engine uses score >= 4 as "trust this as primary metadata"
+        /// and falls back to AI below that.
+        var score: Int
         var albumName: String?
         var artistName: String?
         var trackName: String?
@@ -47,12 +55,14 @@ enum ITunesArtClient {
             // Pick the result whose artist+title best matches what we sent in,
             // not just the top hit — iTunes' relevance ranking sometimes
             // bubbles up remixes / covers / "feat." versions.
-            guard let pick = bestMatch(in: result.results,
-                                       wantArtist: artist,
-                                       wantTitle: title)
+            guard let scored = bestMatch(in: result.results,
+                                         wantArtist: artist,
+                                         wantTitle: title)
             else { return nil }
+            let pick = scored.item
 
             var match = Match(
+                score:       scored.score,
                 albumName:   pick.collectionName,
                 artistName:  pick.artistName,
                 trackName:   pick.trackName,
@@ -90,11 +100,13 @@ enum ITunesArtClient {
     /// compare against (e.g. only album was provided).
     private static func bestMatch(in items: [SearchResponse.Item],
                                   wantArtist: String?,
-                                  wantTitle: String?) -> SearchResponse.Item? {
+                                  wantTitle: String?) -> (score: Int, item: SearchResponse.Item)? {
         guard !items.isEmpty else { return nil }
         let wa = norm(wantArtist)
         let wt = norm(wantTitle)
-        if wa.isEmpty && wt.isEmpty { return items.first }
+        if wa.isEmpty && wt.isEmpty {
+            return (0, items[0])
+        }
 
         var best: (score: Int, item: SearchResponse.Item)?
         for item in items {
@@ -111,10 +123,10 @@ enum ITunesArtClient {
             }
             if score > (best?.score ?? Int.min) { best = (score, item) }
         }
-        // Require at least *some* match if we had something to match on; a
-        // score of 0 means the top result is wildly different — skip it.
-        if (best?.score ?? 0) == 0, !wa.isEmpty || !wt.isEmpty { return nil }
-        return best?.item ?? items.first
+        // A score of 0 means the top result is wildly different from what we
+        // asked for. Return it anyway with score=0 so callers can decide
+        // whether to use it (e.g. backfill with a low-confidence value).
+        return best
     }
 
     private static func norm(_ s: String?) -> String {

@@ -90,7 +90,7 @@ private struct StatusReadout: View {
                 }
                 HStack(spacing: 4) {
                     PillBadge(text: "READY",
-                              on: !state.isProcessing && state.isUnlocked)
+                              on: !state.isProcessing)
                     PillBadge(text: "WORK",
                               on: state.isProcessing,
                               activeColor: WinampTheme.lcdAmber)
@@ -107,18 +107,29 @@ private struct StatusReadout: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
-                    HStack(spacing: 12) {
-                        Text("MODEL").font(WinampTheme.smallFont)
-                            .foregroundColor(WinampTheme.lcdGreenDim)
-                        Text(state.model.isEmpty ? "—" : state.model)
-                            .font(WinampTheme.pixelFont)
-                            .foregroundColor(WinampTheme.lcdCyan)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer()
-                        Text("KEY OK")
+                    HStack(spacing: 8) {
+                        Text("ITUNES")
                             .font(WinampTheme.smallFont)
                             .foregroundColor(WinampTheme.lcdGreen)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(WinampTheme.lcdBg)
+                            .bevelIn()
+
+                        Text(state.aiEnabled ? "AI: " + state.model.uppercased()
+                                             : "AI: OFF")
+                            .font(WinampTheme.smallFont)
+                            .foregroundColor(state.aiEnabled
+                                ? WinampTheme.lcdCyan : WinampTheme.lcdGreenDim)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(WinampTheme.lcdBg)
+                            .bevelIn()
+
+                        Spacer()
+                        Text(state.aiEnabled ? "FALLBACK READY" : "ITUNES-ONLY")
+                            .font(WinampTheme.smallFont)
+                            .foregroundColor(WinampTheme.lcdGreenDim)
                     }
                 }
             }

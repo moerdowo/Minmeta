@@ -31,7 +31,10 @@ final class AppState: ObservableObject {
         }
     }
 
-    var isUnlocked: Bool { !apiKey.isEmpty }
+    /// Convenience: AI fallback is enabled iff a key is present. iTunes
+    /// works without it; the AI step only runs when iTunes returns a low-
+    /// confidence match.
+    var aiEnabled: Bool { !apiKey.isEmpty }
 
     func saveAPIKey(_ key: String, baseURL: String, model: String) {
         let trimmed       = key.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -39,16 +39,9 @@ struct RootView: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        Group {
-            if state.isUnlocked {
-                MainScreenView()
-                    .frame(width: 560, height: 620)
-            } else {
-                LockScreenView()
-                    .frame(width: 560, height: 320)
-            }
-        }
-        .padding(8)
-        .background(WinampTheme.windowBg)
+        MainScreenView()
+            .frame(width: 560, height: 620)
+            .padding(8)
+            .background(WinampTheme.windowBg)
     }
 }
