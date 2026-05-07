@@ -51,20 +51,29 @@ detail line means iTunes was the source; `AI · …` means the model was used.
 
 ## Fields written
 
-| Field         | iTunes | AI fallback |
-|---------------|--------|-------------|
-| Title         | ✓      | ✓           |
-| Artist        | ✓      | ✓           |
-| Album         | ✓      | ✓           |
-| Album artist  | ✓      | ✓           |
-| Year          | ✓      | ✓           |
-| Genre         | ✓      | ✓           |
-| Track number  | ✓      | ✓           |
-| **Composer**  | —      | ✓           |
-| **Copyright** | —      | ✓           |
-| Cover art     | ✓ (600 × 600 JPEG)        | ✓ (re-queries iTunes) |
-| Lyrics (USLT) | —      | —           | (writer infrastructure exists, neither source populates it) |
+When an AI key is configured, both sources run **in parallel** for every
+file. iTunes is the primary source for catalog fields; AI tops up
+composer / copyright (which iTunes doesn't return) and fills any field
+iTunes left empty.
+
+| Field         | iTunes | AI |
+|---------------|--------|----|
+| Title         | ✓ (primary) | ✓ (fills empties) |
+| Artist        | ✓ (primary) | ✓ (fills empties) |
+| Album         | ✓ (primary) | ✓ (fills empties) |
+| Album artist  | ✓ (primary) | ✓ (fills empties) |
+| Year          | ✓ (primary) | ✓ (fills empties) |
+| Genre         | ✓ (primary) | ✓ (fills empties) |
+| Track number  | ✓ (primary) | ✓ (fills empties) |
+| **Composer**  | —           | ✓ (always)        |
+| **Copyright** | —           | ✓ (always)        |
+| Cover art     | ✓ (600 × 600 JPEG) | ✓ (re-queries iTunes) |
+| Lyrics (USLT) | —           | —                 | (writer infrastructure exists, neither source populates it) |
 | Bitrate / sample rate / duration / channels / codec | shown read-only | shown read-only |
+
+If no API key is set, the columns marked "AI" don't run — composer /
+copyright stay empty, and any field iTunes couldn't return is left as
+whatever was already on disk.
 
 ## File formats
 

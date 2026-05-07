@@ -147,65 +147,73 @@ final class ProcessingEngine {
         }
 
         let confident = (lookup?.score ?? 0) >= confidentScore
-
-        // --- 3) Decide path: trust iTunes, AI fallback, or skip -------------
         let aiAvailable = !state.apiKey.isEmpty
+
+        // When a key is set we ALWAYS run the model in parallel with iTunes
+        // so the AI-only fields (composer, copyright) get populated even when
+        // iTunes was confident enough to handle title/artist/album/etc on
+        // its own. Without this, those fields would just stay empty for
+        // catalog music — the user would never see them.
+        if aiAvailable {
+            update(id: id) {
+                $0.phase = .asking
+                $0.detail = "ASKING \(state.model.uppercased()) FOR COMPOSER / COPYRIGHT / EXTRAS"
+            }
+        }
+
+        let aiOutcome: Result<SongMetadata, Error>? = aiAvailable
+            ? await runAI(state: state, url: url, existing: read.meta)
+            : nil
+
+        // --- 3) Decide path: iTunes-primary, AI-primary, or skip ------------
         var finalMeta: SongMetadata = read.meta
         var finalArt: Artwork? = nil
         var sourceTag = ""
 
         if confident, let l = lookup {
-            // Path A — iTunes is good enough on its own.
+            // Path A — iTunes is the source of catalog truth. AI (if it
+            // ran successfully) tops up composer / copyright and any other
+            // fields iTunes left empty.
             finalMeta = applyITunes(read.meta, l)
             finalArt = l.artwork
-            sourceTag = "ITUNES"
-        } else if aiAvailable {
-            // Path B — iTunes wasn't sure. Ask the model to interpret the
-            // filename (handles messy names + non-catalog music). Then
-            // search iTunes a second time with the AI's canonical artist /
-            // title for cleaner art and any final backfill.
+            if case .success(let ai) = aiOutcome {
+                finalMeta = backfillAI(finalMeta, ai)
+                sourceTag = "ITUNES+AI"
+            } else {
+                sourceTag = "ITUNES"
+            }
+        } else if case .success(let ai) = aiOutcome {
+            // Path B — iTunes wasn't confident. AI is primary. Re-query
+            // iTunes with the AI's canonical artist/title for cleaner art
+            // and any final empties.
+            log.info("processOne[\(short)]: AI returned title=\(ai.title ?? "—")")
+            let aiMerged = mergeAI(existing: read.meta, ai: ai)
+
             update(id: id) {
-                $0.phase = .asking
-                $0.detail = "NO ITUNES MATCH · ASKING \(state.model.uppercased())"
+                $0.phase = .art
+                $0.detail = "AI DONE · LOOKING UP ITUNES ART · \(self.describe(aiMerged))"
             }
 
-            let client = OpenAIClient(apiKey: state.apiKey,
-                                      baseURL: state.baseURL,
-                                      model: state.model)
-            do {
-                let aiResolved = try await client.completeMetadata(
-                    filename: url.lastPathComponent,
-                    relativePath: relativePath(for: url),
-                    existing: read.meta
-                )
-                log.info("processOne[\(short)]: AI returned title=\(aiResolved.title ?? "—")")
+            let secondLookup = await ITunesArtClient.lookup(
+                artist: aiMerged.artist,
+                album:  aiMerged.album,
+                title:  aiMerged.title,
+                timeoutSeconds: 8
+            )
 
-                let aiMerged = mergeAI(existing: read.meta, ai: aiResolved)
-
-                update(id: id) {
-                    $0.phase = .art
-                    $0.detail = "AI DONE · LOOKING UP ITUNES ART · \(self.describe(aiMerged))"
-                }
-
-                let secondLookup = await ITunesArtClient.lookup(
-                    artist: aiMerged.artist,
-                    album:  aiMerged.album,
-                    title:  aiMerged.title,
-                    timeoutSeconds: 8
-                )
-
-                finalMeta = backfill(aiMerged, with: secondLookup)
-                finalArt = secondLookup?.artwork ?? lookup?.artwork
-                sourceTag = "AI"
-            } catch {
-                log.error("processOne[\(short)]: AI failed — \(error.localizedDescription)")
-                update(id: id) {
-                    $0.status = .failed
-                    $0.phase = .errored
-                    $0.detail = "AI FAILED — \(error.localizedDescription)"
-                }
-                return
+            finalMeta = backfill(aiMerged, with: secondLookup)
+            finalArt = secondLookup?.artwork ?? lookup?.artwork
+            sourceTag = "AI"
+        } else if case .failure(let err) = aiOutcome {
+            // AI was attempted (key set) but failed AND iTunes wasn't
+            // confident. Surface the AI error.
+            log.error("processOne[\(short)]: AI failed — \(err.localizedDescription)")
+            update(id: id) {
+                $0.status = .failed
+                $0.phase = .errored
+                $0.detail = "AI FAILED — \(err.localizedDescription)"
             }
+            return
         } else {
             // Path C — no AI configured and iTunes couldn't identify the
             // track. Nothing to write. Skip with a useful note.
@@ -409,6 +417,46 @@ final class ProcessingEngine {
         if isEmpty(out.genre)       { out.genre       = lookup.genre }
         if isEmpty(out.track)       { out.track       = lookup.trackNumber }
         return out
+    }
+
+    /// Backfill from an AI result. Used on the iTunes-confident path so
+    /// composer / copyright (and any other fields iTunes happened to leave
+    /// empty) get populated. Existing values are kept — AI is a topper-up
+    /// here, not a replacement.
+    private func backfillAI(_ m: SongMetadata,
+                            _ ai: SongMetadata) -> SongMetadata {
+        var out = m
+        if isEmpty(out.title)       { out.title       = ai.title }
+        if isEmpty(out.artist)      { out.artist      = ai.artist }
+        if isEmpty(out.album)       { out.album       = ai.album }
+        if isEmpty(out.albumArtist) { out.albumArtist = ai.albumArtist }
+        if isEmpty(out.year)        { out.year        = ai.year }
+        if isEmpty(out.genre)       { out.genre       = ai.genre }
+        if isEmpty(out.track)       { out.track       = ai.track }
+        if isEmpty(out.composer)    { out.composer    = ai.composer }
+        if isEmpty(out.copyright)   { out.copyright   = ai.copyright }
+        return out
+    }
+
+    /// Run the model. Returns `.success` with parsed metadata or `.failure`
+    /// with the network/decoding error so callers can decide whether to
+    /// surface it (relevant only when AI was the primary path).
+    private func runAI(state: AppState,
+                       url: URL,
+                       existing: SongMetadata) async -> Result<SongMetadata, Error> {
+        let client = OpenAIClient(apiKey: state.apiKey,
+                                  baseURL: state.baseURL,
+                                  model: state.model)
+        do {
+            let resolved = try await client.completeMetadata(
+                filename: url.lastPathComponent,
+                relativePath: relativePath(for: url),
+                existing: existing
+            )
+            return .success(resolved)
+        } catch {
+            return .failure(error)
+        }
     }
 
     private func isEmpty(_ s: String?) -> Bool {
