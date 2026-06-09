@@ -157,3 +157,7 @@ Tools/
 - Unsupported containers (FLAC / WAV / OGG) are intentionally `SKIPPED`, not
   `FAILED`; the metadata suggestion is still surfaced in the row's detail
   line for reference.
+
+## License
+
+Released under the [MIT License](LICENSE).
